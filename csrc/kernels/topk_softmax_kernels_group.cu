@@ -707,10 +707,23 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
 //   * !isSoftmax -- the softmax path normalises over the whole row first
 //   * num_experts <= RADIX_SLOTS * WARP_SIZE * vec_size
 //
-// Selected experts are emitted in ascending expert order instead of descending
-// score order. The op does not fix that order: op_tests compares after sorting
-// by id, "this is useful when we don't care about the absolute position of the
-// val/idx".
+// Emission order differs from grouped_topk_kernel, which emits in descending
+// biased-score order because it selects by repeated arg-max. Here a selected
+// expert's position follows the register that held it, so the order is
+// lexicographic in (slot, vector lane, wave lane) -- deterministic, but neither
+// score order nor ascending expert id. Weights stay paired with their ids.
+//
+// That is within the op's contract:
+//   * biased_grouped_topk_torch, the golden this is checked against, selects
+//     with torch::topk(..., sorted=False)
+//   * biased_grouped_topk already dispatches to moe_fused_gate above
+//     cu_num * 212 tokens, and that kernel emits a different order again, so
+//     the order already depends on the token count
+//   * op_tests compares after sorting by id, "this is useful when we don't care
+//     about the absolute position of the val/idx", and notes the HIP order is
+//     unpredictable
+//   * topk_weights is the pre-bias sigmoid while selection uses the biased
+//     score, so topk_weights is not sorted on any existing path either
 template <typename DTYPE_I, typename f32vec, bool need_renorm, bool isBiased>
 __global__ void
 grouped_topk_radix_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens, hidden_size]
@@ -859,6 +872,10 @@ grouped_topk_radix_kernel(DTYPE_I* __restrict__ gating_output,         // [num_t
         thresh |= ((packed >> 24) & 0xFFu) << shift;
 
         // Boundary bucket exactly consumed: no finer digit can change the set.
+        // need cannot exceed cnt, because the branch above only fires when
+        // before < need <= before + mine[i], so the new need lands in
+        // [1, mine[i]] while cnt is mine[i]. Equality is therefore the only way
+        // out, and `need > cnt` is unreachable rather than merely unhandled.
         if(need == cnt)
             break;
     }
@@ -1618,6 +1635,12 @@ inline int radix_vec_width(int num_experts)
 //               at one token and 0.93x at 4096), so it is claimed only below
 //               that point
 //   topk <= 4   a wash or a slight loss, never claimed
+//
+// The expert-count ceiling is RADIX_SLOTS * WARP_SIZE * vec_size, and vec_size
+// follows num_experts % 4, so the ceiling is not uniform: 1024 experts for the
+// vec4 path but 512 for vec2 and 256 for vec1. Wide routers divide by 4 in
+// practice (Kimi-K3 is 896, Kimi-K2.5 is 384), so this only excludes unusual
+// counts -- 898 experts would take vec2 and exceed 512, and fall back.
 inline bool radix_topk_applicable(
     int num_experts, int topk, int num_expert_group, bool is_softmax, int num_tokens)
 {

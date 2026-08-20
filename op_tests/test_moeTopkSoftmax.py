@@ -430,6 +430,189 @@ def test_grouped_topk(
     return {"err": err, "us": us_aiter}
 
 
+def check_grouped_topk_pairing(
+    gating_output,
+    correction_bias,
+    topk_weights,
+    topk_ids,
+    need_renorm,
+    scale_factor,
+    msg,
+):
+    """Assert a grouped-topk result without assuming any emission order.
+
+    Order is not part of this op's contract: the torch golden selects with
+    sorted=False, biased_grouped_topk dispatches to moe_fused_gate above
+    cu_num * 212 tokens and that kernel emits a different order again, and
+    topk_weights holds the pre-bias sigmoid while selection uses the biased
+    score, so topk_weights is not sorted on any path. So check the two things
+    that are guaranteed:
+
+      1. the selected set is a valid top-k, i.e. its sorted biased scores equal
+         torch's. This tolerates ties, where several experts are equally
+         correct answers, without tolerating a wrong pick.
+      2. each weight is the one belonging to the id sitting beside it, which is
+         what a permuted emission order could plausibly break.
+    """
+    scores = gating_output.to(dtypes.fp32).sigmoid()
+    biased = (
+        scores if correction_bias is None else scores + correction_bias.to(dtypes.fp32)
+    )
+    topk = topk_ids.shape[1]
+
+    assert bool((topk_ids >= 0).all()), f"{msg}: unfilled slot"
+    assert bool((topk_ids < gating_output.shape[1]).all()), (
+        f"{msg}: expert id out of range"
+    )
+    srt = torch.sort(topk_ids, dim=-1).values
+    assert bool((srt[:, 1:] != srt[:, :-1]).all()), f"{msg}: duplicate expert in a row"
+
+    ref_biased = torch.topk(biased, topk, dim=-1).values
+    got_biased = torch.sort(
+        biased.gather(-1, topk_ids.long()), -1, descending=True
+    ).values
+    checkAllclose(ref_biased, got_biased, msg=f"{msg} selected biased scores")
+
+    want = scores.gather(-1, topk_ids.long())
+    if need_renorm:
+        want = want / want.sum(-1, keepdim=True)
+    checkAllclose(want * scale_factor, topk_weights, msg=f"{msg} weight/id pairing")
+
+
+def test_grouped_topk_radix_envelope():
+    """Cover the dispatch envelope of the ungrouped radix path.
+
+    grouped_topk_radix_kernel takes over for ungrouped sigmoid routers, and it
+    holds RADIX_SLOTS * WARP_SIZE * vec_size scores in registers. vec_size
+    follows num_experts % 4, so the expert ceiling is 1024 for the vec4 path but
+    512 for vec2 and 256 for vec1. Each width is exercised on both sides of its
+    own ceiling, because a count picked to select a narrow width can otherwise
+    quietly fall back to grouped_topk_kernel and test nothing.
+    """
+    shapes = [
+        # experts, vec_size, inside its own ceiling
+        (896, 4, True),  # Kimi-K3
+        (1024, 4, True),  # vec4 ceiling exactly
+        (1028, 4, False),  # one vector past it, falls back
+        (384, 4, True),  # Kimi-K2.5
+        (510, 2, True),  # vec2, inside 512
+        (514, 2, False),  # vec2, past 512
+        (898, 2, False),  # vec2, well past 512
+        (255, 1, True),  # vec1, inside 256
+        (257, 1, False),  # vec1, past 256
+        (897, 1, False),  # vec1, well past 256
+    ]
+    fails = 0
+    for expert, vec_size, inside in shapes:
+        assert (4 if expert % 4 == 0 else (2 if expert % 4 == 2 else 1)) == vec_size
+        for topk in [8, 16, 32]:
+            if topk > expert:
+                continue
+            for dtype in [dtypes.fp32, dtypes.bf16]:
+                for need_renorm, scale_factor in [
+                    (True, 1.0),
+                    (False, 2.5),
+                    (True, 2.827),
+                ]:
+                    for token in [1, 3, 64, 1024]:
+                        tag = (
+                            f"{expert}e/vec{vec_size}/top{topk}/{token}t/"
+                            f"{'renorm' if need_renorm else 'raw'}/{dtype}"
+                        )
+                        gating_output = torch.randn((token, expert), dtype=dtype)
+                        correction_bias = torch.randn((expert,), dtype=dtype)
+                        w = torch.empty_strided(
+                            (token, topk), (topk + 10, 1), dtype=dtypes.fp32
+                        )
+                        i = torch.empty_strided(
+                            (token, topk), (topk + 10, 1), dtype=dtypes.i32
+                        )
+                        i.fill_(-1)
+                        aiter.biased_grouped_topk_hip(
+                            gating_output,
+                            correction_bias,
+                            w,
+                            i,
+                            1,
+                            1,
+                            need_renorm,
+                            scale_factor,
+                        )
+                        try:
+                            check_grouped_topk_pairing(
+                                gating_output,
+                                correction_bias,
+                                w,
+                                i,
+                                need_renorm,
+                                scale_factor,
+                                f"biased {tag}",
+                            )
+                        except AssertionError as e:
+                            aiter.logger.error("%s", e)
+                            fails += 1
+
+                        # The non-biased entry point instantiates the other side
+                        # of the isBiased template and is otherwise untested here.
+                        w.zero_()
+                        i.fill_(-1)
+                        aiter.grouped_topk(
+                            gating_output, w, i, 1, 1, need_renorm, False, scale_factor
+                        )
+                        try:
+                            check_grouped_topk_pairing(
+                                gating_output,
+                                None,
+                                w,
+                                i,
+                                need_renorm,
+                                scale_factor,
+                                f"plain {tag}",
+                            )
+                        except AssertionError as e:
+                            aiter.logger.error("%s", e)
+                            fails += 1
+    assert fails == 0, f"{fails} grouped-topk envelope checks failed"
+    aiter.logger.info("grouped_topk radix envelope: all shapes correct")
+
+
+def test_grouped_topk_ties():
+    """Ties force the radix select's non-exact path.
+
+    When the boundary bucket holds more equal keys than there are slots left,
+    the kernel cannot take the whole bucket and has to take a rank-limited
+    subset of it. Random logits essentially never reach that path, so drive it
+    with a tiny set of distinct values.
+    """
+    fails = 0
+    for expert, topk in [(896, 16), (1024, 32), (510, 16), (255, 16), (384, 8)]:
+        for levels in [2, 3, 5]:
+            for token in [1, 64]:
+                tag = f"{expert}e/top{topk}/{levels} distinct logits/{token}t"
+                gating_output = (
+                    torch.randint(0, levels, (token, expert)).to(dtypes.fp32)
+                    - levels // 2
+                )
+                correction_bias = torch.zeros((expert,), dtype=dtypes.fp32)
+                w = torch.empty_strided(
+                    (token, topk), (topk + 10, 1), dtype=dtypes.fp32
+                )
+                i = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
+                i.fill_(-1)
+                aiter.biased_grouped_topk_hip(
+                    gating_output, correction_bias, w, i, 1, 1, True, 1.0
+                )
+                try:
+                    check_grouped_topk_pairing(
+                        gating_output, correction_bias, w, i, True, 1.0, tag
+                    )
+                except AssertionError as e:
+                    aiter.logger.error("%s", e)
+                    fails += 1
+    assert fails == 0, f"{fails} grouped-topk tie checks failed"
+    aiter.logger.info("grouped_topk ties: all shapes correct")
+
+
 @perftest(num_iters=2, num_warmup=1)
 def test_nofuse_shared(
     gating_output: torch.Tensor,
@@ -633,6 +816,12 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+
+# Correctness of the ungrouped radix dispatch envelope. Run first and let it
+# raise: unlike the benchmark tables below, a failure here is a real bug rather
+# than a tie-ordering difference.
+test_grouped_topk_radix_envelope()
+test_grouped_topk_ties()
 
 df = []
 for dtype in args.dtype:
