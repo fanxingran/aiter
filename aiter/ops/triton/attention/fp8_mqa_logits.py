@@ -1,8 +1,22 @@
 import inspect
+import os
 
 import torch
 import triton
 from packaging.version import Version
+
+# O1: query rows per workgroup in the gfx950 indexer-logits kernel. The stock
+# kernel is one wave per query token, so the whole indexer K stream is re-read
+# once per row; sharing an LDS-resident K tile across RPB rows divides that
+# traffic by RPB. 1 restores the stock kernel entirely.
+_MQA_LOGITS_RPB = int(os.environ.get("AITER_MQA_LOGITS_RPB", "2"))
+# O3: evict-first on the logits stream, so the multi-GB write does not push the
+# indexer K out of L2 / Infinity Cache. "" restores the default store.
+_MQA_LOGITS_STORE_CACHE = os.environ.get("AITER_MQA_LOGITS_STORE_CACHE", ".cs")
+# Opt-in fast path: drops the per-row lower-bound store mask. Only correct when
+# every cu_start is identical (true for GLM-5.2 dense chunked prefill, which
+# passes an all-zero cu_starts). Worth ~4.5%; off unless the caller guarantees it.
+_MQA_LOGITS_UNIFORM_START = os.environ.get("AITER_MQA_LOGITS_UNIFORM_START") == "1"
 
 from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
@@ -217,6 +231,54 @@ def fp8_mqa_logits(
         BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
         use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
         use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
+
+        if arch == "gfx950" and _MQA_LOGITS_RPB > 1:
+            from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits_rpb import (
+                _gluon_fp8_mqa_logits_kernel_rpb,
+            )
+
+            rpb = _MQA_LOGITS_RPB
+            _gluon_fp8_mqa_logits_kernel_rpb[((seq_len + rpb - 1) // rpb,)](
+                Q_ptr=Q,
+                KV_ptr=KV,
+                kv_scales_ptr=kv_scales,
+                weights_ptr=weights,
+                cu_start_ptr=cu_starts,
+                cu_end_ptr=cu_ends,
+                logits_ptr=logits,
+                seq_len=seq_len,
+                seq_len_kv=seq_len_kv,
+                NUM_HEADS=num_heads,
+                HEAD_SIZE=head_size,
+                stride_q_s=stride_q_s,
+                stride_q_h=stride_q_h,
+                stride_q_d=stride_q_d,
+                stride_kv_s=stride_kv_s,
+                stride_kv_d=stride_kv_d,
+                stride_w_s=stride_w_s,
+                stride_w_h=stride_w_h,
+                stride_logits_s=stride_logits_s,
+                stride_logits_k=stride_logits_k,
+                BLOCK_KV=block_kv,
+                ROWS_PER_BLOCK=rpb,
+                NUM_BUFFERS=num_buffers,
+                NUM_CHAINS=num_chains,
+                USE_BUFFER_LOAD=use_buffer_load,
+                # Stores address off a per-row base pointer, so the 2 GiB
+                # descriptor cap applies per logits row, not to the whole tensor.
+                USE_BUFFER_STORE=(
+                    logits.shape[1] * logits.element_size() < BUFFER_LIMIT_BYTES
+                ),
+                USE_PADDED_SHARED_LAYOUT=ASYNC_COPY_SUPPORTS_DISTRIBUTED,
+                FAST_RELU=False,
+                UNIFORM_START=_MQA_LOGITS_UNIFORM_START,
+                STORE_CACHE=_MQA_LOGITS_STORE_CACHE,
+                OUT_BF16=(logits.dtype == torch.bfloat16),
+                num_warps=num_warps,
+                waves_per_eu=waves_per_eu,
+            )
+            return logits
+
         _gluon_fp8_mqa_logits_kernel[(seq_len,)](
             Q_ptr=Q,
             KV_ptr=KV,
