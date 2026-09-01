@@ -24,6 +24,24 @@ from aiter.ops.triton.utils.config_utils import (
 
 STANDARD_M_BOUNDS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
+# Values a tuned entry may hold that a shallow copy would leave shared with the
+# LRU cache.  No config shipped today has one -- all 2110 bucket entries across
+# the 315 gemm config files are flat scalars -- so this is a guard against a
+# future table, not a case that occurs.
+_MUTABLE_TYPES = (dict, list, set, bytearray)
+
+
+def _resolved(entry: dict, is_tuned: bool) -> tuple[dict, bool, bool]:
+    """Package a resolved entry with whether a shallow copy of it is safe.
+
+    Deciding this here rather than per call matters: the check is a scan over
+    the entry's values, which costs about as much again as the shallow copy it
+    is trying to enable, and this function's result is memoized while
+    ``get_gemm_config()`` runs on every kernel invocation.
+    """
+    shallow_ok = not any(isinstance(v, _MUTABLE_TYPES) for v in entry.values())
+    return entry, is_tuned, shallow_ok
+
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
 def _get_gemm_config_cached(
@@ -35,10 +53,10 @@ def _get_gemm_config_cached(
     specialized_filename: str | None = None,
     backend: str = "triton",
     B: int | None = None,
-) -> tuple[dict, bool]:
+) -> tuple[dict, bool, bool]:
     """
     Internal cached implementation. Do NOT use this directly — use
-    ``get_gemm_config()`` instead, which returns a defensive deep-copy so
+    ``get_gemm_config()`` instead, which returns a defensive copy so
     callers can freely mutate the returned dict without polluting the cache.
 
     Resolves from ``<arch>/<backend>/gemm/<d_type>/`` (prefix-less filenames,
@@ -93,16 +111,16 @@ def _get_gemm_config_cached(
     for bound in search_bounds:
         key = f"M_LEQ_{bound}"
         if M <= bound and key in config_dict:
-            return dict(config_dict[key]), is_tuned
+            return _resolved(dict(config_dict[key]), is_tuned)
 
     # Search for M_GEQ_x keys
     for bound in reversed(search_bounds):
         key = f"M_GEQ_{bound}"
         if M >= bound and key in config_dict:
-            return dict(config_dict[key]), is_tuned
+            return _resolved(dict(config_dict[key]), is_tuned)
 
     if "any" in config_dict:
-        return dict(config_dict["any"]), False
+        return _resolved(dict(config_dict["any"]), False)
 
     raise KeyError(
         f"No matching configuration found for M={M}, N={N}, K={K}, B={B}, "
@@ -146,13 +164,21 @@ def get_gemm_config(
         B: Batch dimension for batched GEMM (optional)
 
     Returns:
-        Dictionary with the config params (a fresh deep-copy safe to mutate),
+        Dictionary with the config params (a fresh copy, safe to mutate),
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
-    config, is_tuned = _get_gemm_config_cached(
+    config, is_tuned, shallow_ok = _get_gemm_config_cached(
         config_name, M, N, K, bounds, specialized_filename, backend, B
     )
-    return copy.deepcopy(config), is_tuned
+    # The copy is what lets callers mutate the result -- several kernels do, via
+    # add_default_gemm_config_params and their own overrides -- without the
+    # mutation reaching the cached entry and the next caller.  copy.deepcopy was
+    # 2.43us of the 2.57us this function cost, ~40x a shallow copy of the same
+    # 8-key dict, and it is paid on every invocation of every kernel that takes
+    # config=None: once per GEMM per layer, so hundreds of microseconds per
+    # prefill chunk.  Entries whose values are all immutable copy shallowly;
+    # anything else still goes deep.
+    return (dict(config) if shallow_ok else copy.deepcopy(config)), is_tuned
 
 
 def add_default_gemm_config_params(config: dict) -> dict:
